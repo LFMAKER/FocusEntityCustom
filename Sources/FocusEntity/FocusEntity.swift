@@ -6,6 +6,7 @@
 //  Copyright © 2019 Max Cobb. All rights reserved.
 //
 
+import Foundation
 import RealityKit
 #if canImport(RealityFoundation)
 import RealityFoundation
@@ -15,8 +16,9 @@ import RealityFoundation
 #warning("FocusEntity: This package is only fully available with physical iOS devices")
 #endif
 
-#if canImport(ARKit) && !targetEnvironment(simulator)
+#if canImport(ARKit)
 import ARKit
+#endif
 import Combine
 
 public protocol HasFocusEntity: Entity {}
@@ -34,18 +36,51 @@ public extension HasFocusEntity {
         get { self.focus.segments }
         set { self.focus.segments = newValue }
     }
+    #if canImport(ARKit)
     var allowedRaycast: ARRaycastQuery.Target {
         get { self.focus.allowedRaycast }
         set { self.focus.allowedRaycast = newValue }
     }
+    #endif
 }
 
-@objc public protocol FocusEntityDelegate {
+public protocol FocusEntityDelegate: AnyObject {
     /// Called when the FocusEntity is now in world space
-    @objc optional func toTrackingState()
+    func toTrackingState()
 
     /// Called when the FocusEntity is tracking the camera
-    @objc optional func toInitializingState()
+    func toInitializingState()
+
+    /// When the tracking state of the FocusEntity updates. This will be called every update frame.
+    /// - Parameters:
+    ///   - focusEntity: FocusEntity object whose tracking state has changed.
+    ///   - trackingState: New tracking state of the focus entity.
+    ///   - oldState: Old tracking state of the focus entity.
+    func focusEntity(
+        _ focusEntity: FocusEntity,
+        trackingUpdated trackingState: FocusEntity.State,
+        oldState: FocusEntity.State
+    )
+
+    /// When the plane this focus entity is tracking changes. If the focus entity moves around within one plane anchor there will be no calls.
+    /// - Parameters:
+    ///   - focusEntity: FocusEntity object whose anchor has changed.
+    ///   - planeChanged: New anchor the focus entity is tracked to.
+    ///   - oldPlane: Previous anchor the focus entity is tracked to.
+    func focusEntity(
+        _ focusEntity: FocusEntity,
+        planeChanged: ARPlaneAnchor?,
+        oldPlane: ARPlaneAnchor?
+    )
+}
+
+public extension FocusEntityDelegate {
+    func toTrackingState() {}
+    func toInitializingState() {}
+    func focusEntity(
+        _ focusEntity: FocusEntity, trackingUpdated trackingState: FocusEntity.State, oldState: FocusEntity.State
+    ) {}
+    func focusEntity(_ focusEntity: FocusEntity, planeChanged: ARPlaneAnchor?, oldPlane: ARPlaneAnchor?) {}
 }
 
 /**
@@ -92,14 +127,15 @@ open class FocusEntity: Entity, HasAnchoring, HasFocusEntity {
 
     public func setAutoUpdate(to autoUpdate: Bool) {
         guard autoUpdate != self.isAutoUpdating,
-              !(autoUpdate && self.arView == nil) else {
-                  return
-              }
+              !(autoUpdate && self.arView == nil)
+        else { return }
         self.updateCancellable?.cancel()
         if autoUpdate {
+            #if canImport(ARKit)
             self.updateCancellable = self.myScene?.subscribe(
                 to: SceneEvents.Update.self, self.updateFocusEntity
             )
+            #endif
         }
         self.isAutoUpdating = autoUpdate
     }
@@ -108,7 +144,9 @@ open class FocusEntity: Entity, HasAnchoring, HasFocusEntity {
     // MARK: - Types
     public enum State: Equatable {
         case initializing
+        #if canImport(ARKit)
         case tracking(raycastResult: ARRaycastResult, camera: ARCamera?)
+        #endif
     }
 
     // MARK: - Properties
@@ -117,14 +155,18 @@ open class FocusEntity: Entity, HasAnchoring, HasFocusEntity {
     var lastPosition: SIMD3<Float>? {
         switch state {
         case .initializing: return nil
+        #if canImport(ARKit)
         case .tracking(let raycastResult, _): return raycastResult.worldTransform.translation
+        #endif
         }
     }
 
+    #if canImport(ARKit)
     fileprivate func entityOffPlane(_ raycastResult: ARRaycastResult, _ camera: ARCamera?) {
         self.onPlane = false
         displayOffPlane(for: raycastResult)
     }
+    #endif
 
     public var state: State = .initializing {
         didSet {
@@ -134,24 +176,27 @@ open class FocusEntity: Entity, HasAnchoring, HasFocusEntity {
             case .initializing:
                 if oldValue != .initializing {
                     displayAsBillboard()
-                    self.delegate?.toInitializingState?()
+                    self.delegate?.toInitializingState()
                 }
+            #if canImport(ARKit)
             case let .tracking(raycastResult, camera):
                 let stateChanged = oldValue == .initializing
                 if stateChanged && self.anchor != nil {
                     self.anchoring = AnchoringComponent(.world(transform: Transform.identity.matrix))
                 }
-                if let planeAnchor = raycastResult.anchor as? ARPlaneAnchor {
+                let planeAnchor = raycastResult.anchor as? ARPlaneAnchor
+                if let planeAnchor = planeAnchor {
                     entityOnPlane(for: raycastResult, planeAnchor: planeAnchor)
-                    currentPlaneAnchor = planeAnchor
                 } else {
                     entityOffPlane(raycastResult, camera)
-                    currentPlaneAnchor = nil
                 }
+                defer { currentPlaneAnchor = planeAnchor }
                 if stateChanged {
-                    self.delegate?.toTrackingState?()
+                    self.delegate?.toTrackingState()
                 }
+            #endif
             }
+            self.delegate?.focusEntity(self, trackingUpdated: state, oldState: oldValue)
         }
     }
 
@@ -166,20 +211,29 @@ open class FocusEntity: Entity, HasAnchoring, HasFocusEntity {
     /// A camera anchor used for placing the focus entity in front of the camera.
     internal var cameraAnchor: AnchorEntity!
 
+    #if canImport(ARKit)
     /// The focus square's current alignment.
     internal var currentAlignment: ARPlaneAnchor.Alignment?
 
     /// The current plane anchor if the focus square is on a plane.
-    public internal(set) var currentPlaneAnchor: ARPlaneAnchor?
-
-    /// The focus square's most recent positions.
-    internal var recentFocusEntityPositions: [SIMD3<Float>] = []
+    public internal(set) var currentPlaneAnchor: ARPlaneAnchor? {
+        didSet {
+            if (oldValue == nil && self.currentPlaneAnchor == nil) || (currentPlaneAnchor == oldValue) {
+                return
+            }
+            self.delegate?.focusEntity(self, planeChanged: currentPlaneAnchor, oldPlane: oldValue)
+        }
+    }
 
     /// The focus square's most recent alignments.
     internal var recentFocusEntityAlignments: [ARPlaneAnchor.Alignment] = []
 
     /// Previously visited plane anchors.
     internal var anchorsOfVisitedPlanes: Set<ARAnchor> = []
+    #endif
+
+    /// The focus square's most recent positions.
+    internal var recentFocusEntityPositions: [SIMD3<Float>] = []
 
     /// The primary node that controls the position of other `FocusEntity` nodes.
     internal let positioningEntity = Entity()
@@ -213,7 +267,7 @@ open class FocusEntity: Entity, HasAnchoring, HasFocusEntity {
 
         // Start the focus square as a billboard.
         displayAsBillboard()
-        self.delegate?.toInitializingState?()
+        self.delegate?.toInitializingState()
         arView.scene.addAnchor(self)
         self.setAutoUpdate(to: true)
         switch self.focus.style {
@@ -245,7 +299,9 @@ open class FocusEntity: Entity, HasAnchoring, HasFocusEntity {
     /// Displays the focus square parallel to the camera plane.
     private func displayAsBillboard() {
         self.onPlane = false
+        #if canImport(ARKit)
         self.currentAlignment = .none
+        #endif
         stateChangedSetup()
     }
 
@@ -263,6 +319,7 @@ open class FocusEntity: Entity, HasAnchoring, HasFocusEntity {
         performAlignmentAnimation(to: newRotation)
     }
 
+    #if canImport(ARKit)
     /// Called when a surface has been detected.
     private func displayOffPlane(for raycastResult: ARRaycastResult) {
         self.stateChangedSetup()
@@ -293,6 +350,7 @@ open class FocusEntity: Entity, HasAnchoring, HasFocusEntity {
         }
         updateTransform(raycastResult: raycastResult)
     }
+    #endif
 
     /// Called whenever the state of the focus entity changes
     ///
@@ -315,6 +373,7 @@ open class FocusEntity: Entity, HasAnchoring, HasFocusEntity {
         self.stateChanged(newPlane: newPlane)
     }
 
+    #if canImport(ARKit)
     public func updateFocusEntity(event: SceneEvents.Update? = nil) {
         // Perform hit testing only when ARKit tracking is in a good state.
         guard let camera = self.arView?.session.currentFrame?.camera,
@@ -329,20 +388,5 @@ open class FocusEntity: Entity, HasAnchoring, HasFocusEntity {
 
         self.state = .tracking(raycastResult: result, camera: camera)
     }
+    #endif
 }
-#else
-/**
- FocusEntity is only enabled for environments which can import ARKit.
- */
-open class FocusEntity {
-    public convenience init(on arView: ARView, style: FocusEntityComponent.Style) {
-        self.init(on: arView, focus: FocusEntityComponent(style: style))
-    }
-    public convenience init(on arView: ARView, focus: FocusEntityComponent) {
-        self.init()
-    }
-    internal init() {
-        print("This is only supported on a physical iOS device.")
-    }
-}
-#endif
